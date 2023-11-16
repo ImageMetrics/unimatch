@@ -137,7 +137,8 @@ def flow_to_color(flow_uv, clip_flow=None, convert_to_bgr=False):
     return flow_compute_color(u, v, convert_to_bgr)
 
 
-UNKNOWN_FLOW_THRESH = 1e7
+# UNKNOWN_FLOW_THRESH = 1e7
+UNKNOWN_FLOW_THRESH = 1e1
 SMALLFLOW = 0.0
 LARGEFLOW = 1e8
 
