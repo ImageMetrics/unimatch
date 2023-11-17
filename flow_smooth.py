@@ -1,6 +1,7 @@
 import argparse
 import collections
 import os
+import shutil
 
 import numpy as np
 import torch
@@ -150,27 +151,34 @@ def get_test_data(track_only_regions=True):
 
     all_landmarks = []
     all_image_files = []
-    for test_data_file in test_files:
-        npz_file = np.load(test_data_file)
-        if track_only_regions:
-            video_name = os.path.basename(test_data_file)[:-11]
-            if video_name not in _COMPARISON_REGIONS.keys():
-                raise RuntimeError(f'Missing video regions: {video_name}')
-            image_files = []
-            landmarks = []
-            for region in _COMPARISON_REGIONS[video_name]:
-                image_files.extend(
-                    npz_file['image_files'][region.range]
-                )
-                landmarks.append(
-                    npz_file['landmarks'][region.range, :, :]
-                )
-            landmarks = np.concatenate(landmarks, axis=0)
-        else:
+    if track_only_regions:
+        # find continuous non-overlapping ranges
+        for video_name in _COMPARISON_REGIONS.keys():
+            test_data_file = os.path.join(ROOT_DIR, r'Results\LDSDK', f'{video_name}_Frames.npz')
+            npz_file = np.load(test_data_file)
             image_files = npz_file['image_files']
             landmarks = npz_file['landmarks']
-        all_landmarks.append(landmarks)
-        all_image_files.append(image_files)
+
+            # get all frames we'd like to track
+            frame_inds = np.zeros(len(image_files))
+            for region in _COMPARISON_REGIONS[video_name]:
+                frame_inds[region.range] = 1
+            frame_inds = np.nonzero(frame_inds)[0].tolist()
+
+            # find continuous regions - this is a clever method of doing that
+            from itertools import groupby
+            from operator import itemgetter
+            for k, g in groupby(enumerate(frame_inds), lambda ix: ix[0] - ix[1]):
+                group_frame_inds = list(map(itemgetter(1), g))
+                all_landmarks.append(landmarks[group_frame_inds, :, :])
+                all_image_files.append([image_files[i] for i in group_frame_inds])
+    else:
+        for test_data_file in test_files:
+            npz_file = np.load(test_data_file)
+            image_files = npz_file['image_files']
+            landmarks = npz_file['landmarks']
+            all_landmarks.append(landmarks)
+            all_image_files.append(image_files)
 
     return all_image_files, all_landmarks
 
@@ -380,8 +388,8 @@ def optical_flow_compute_all(args,
                            )
 
 
-def flow_smooth_video(image_files, landmarks,
-                      display=False):
+def flow_smooth_sequence(image_files, landmarks,
+                         display=False):
     if display:
         import matplotlib.pyplot as plt
         fig_flow, ax_flow = plt.subplots(nrows=1, ncols=2)
@@ -455,6 +463,14 @@ def flow_smooth_video(image_files, landmarks,
 
     smoothed_landmarks = np.array(smoothed_landmarks)
     output_file_name = os.path.join(OUTPUT_DIR, 'smoothed', f'{video_name}.smoothed.npz')
+
+    # concatenate to existing data
+    if os.path.exists(output_file_name):
+        npz_file = np.load(output_file_name)
+        landmarks = np.concatenate((npz_file['landmarks'], landmarks))
+        smoothed_landmarks = np.concatenate((npz_file['smoothed_landmarks'], smoothed_landmarks))
+        image_files = npz_file['image_files'].tolist() + image_files
+
     np.savez(output_file_name,
              landmarks=landmarks,
              smoothed_landmarks=smoothed_landmarks,
@@ -463,10 +479,17 @@ def flow_smooth_video(image_files, landmarks,
 
 
 def optical_flow_smooth_all(display=False):
+
     all_image_files, all_landmarks = get_test_data()
 
+    # clear results dir
+    results_dir = os.path.join(OUTPUT_DIR, 'smoothed')
+    shutil.rmtree(results_dir)
+    os.makedirs(results_dir)
+
+    # generate results
     for image_files, landmarks in zip(all_image_files, all_landmarks):
-        flow_smooth_video(image_files, landmarks,
+        flow_smooth_sequence(image_files, landmarks,
                           display=display,
                           )
 
