@@ -202,6 +202,7 @@ def adjust_flow_with_tracking(flow_landmarks, landmarks):
     out_landmarks[:, 1] = out_landmarks[:, 1] * w_y + landmarks[:, 1] * (1 - w_y)
     return out_landmarks
 
+
 @torch.no_grad()
 def compute_flow(model, image1, image2,
                  retain_inference_size=False,
@@ -279,69 +280,6 @@ def compute_flow(model, image1, image2,
     return flow
 
 
-# @torch.no_grad()
-# def inference_flow(model, filenames, landmarks,
-#                    redo_flow=False,
-#                    fixed_inference_size = None,
-#                    padding_factor=32,
-#                    attn_type='swin',
-#                    attn_splits_list=None,
-#                    corr_radius_list=None,
-#                    prop_radius_list=None,
-#                    num_reg_refine=1,
-#                    pred_bidir_flow=False,
-#                    ):
-#     import matplotlib.pyplot as plt
-#     plt.figure(1)
-#     fig_flow, ax_flow = plt.subplots(nrows=1, ncols=2)
-#     cb1 = cb2 = None
-#     plt.figure(2)
-#     fig_im, ax_im = plt.subplots(nrows=1, ncols=2)
-#
-#     landmarks_flow = None
-#
-#
-#         if cb1 is not None:
-#             cb1.remove()
-#             cb2.remove()
-#         ax_flow[0].cla()
-#         im1 = ax_flow[0].imshow(flow[:, :, 0])
-#         ax_flow[1].cla()
-#         im2 = ax_flow[1].imshow(flow[:, :, 1])
-#         cb1 = fig_flow.colorbar(im1, ax=ax_flow[0])
-#         cb2 = fig_flow.colorbar(im2, ax=ax_flow[1])
-#         # fig_flow.colorbar(im, ax=ax_flow[1])
-#         fig_flow.show()
-#
-#         ax_im[0].cla()
-#         ax_im[0].imshow(disp_im_1)
-#         ax_im[0].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1])
-#         ax_im[1].cla()
-#         ax_im[1].imshow(disp_im_2)
-#         ax_im[1].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1], marker='.')
-#         ax_im[1].scatter(landmarks[test_id+1, :, 0], landmarks[test_id+1, :, 1], marker='+')
-#
-#         pass
-#         # BROW_INNER_LEFT: 0
-#         # BROW_INNER_RIGHT: 2
-#         # BROW_OUTER_LEFT: 14
-#         # BROW_OUTER_RIGHT: 15
-#         # NOSE_RIDGE_TIP: 72
-#         landmark_inds = [0, 2, 14, 15, 72]
-#
-#         if landmarks_flow is None:
-#             landmarks_flow = landmarks[test_id, :, :]
-#
-#         landmarks_flow = motion_from_flow(flow, landmarks_flow)
-#         ax_im[1].scatter(landmarks_flow[:, 0], landmarks_flow[:, 1], marker='.')
-#
-#         landmarks_flow = adjust_flow_with_tracking(landmarks_flow, landmarks[test_id+1, :, :])
-#         ax_im[1].scatter(landmarks_flow[:, 0], landmarks_flow[:, 1], marker='+')
-#
-#         fig_im.canvas.draw()
-#         fig_im.show()
-#         pass
-
 def compute_flow_video(model, image_files,
                        retain_inference_size=False,
                        redo_flow=False,
@@ -354,8 +292,10 @@ def compute_flow_video(model, image_files,
         cb1 = cb2 = None
 
     from utils import frame_utils
+    import tqdm
     os.makedirs(os.path.join(OUTPUT_DIR, 'flow'), exist_ok=True)
-    for test_id in range(0, len(image_files) - 1):
+    video_name = os.path.basename(os.path.dirname(image_files[0]))
+    for test_id in tqdm.tqdm(range(0, len(image_files) - 1), desc=video_name):
         basename = os.path.basename(image_files[test_id + 1])
         output_file_name = os.path.join(OUTPUT_DIR, 'flow', f'{basename}.flow.npz')
         if redo_flow or not os.path.exists(output_file_name):
@@ -381,11 +321,6 @@ def compute_flow_video(model, image_files,
                 fig_flow.show()
                 fig_flow.canvas.draw()
                 plt.pause(0.001)
-        else:
-            npz_file = np.load(output_file_name)
-            flow = npz_file['flow']
-
-    return flow
 
 
 def optical_flow_compute_all(args,
@@ -438,11 +373,108 @@ def optical_flow_compute_all(args,
                            fixed_inference_size=args.fixed_inference_size,
                            )
 
+
+def flow_smooth_video(image_files, landmarks,
+                      display=False):
+    if display:
+        import matplotlib.pyplot as plt
+        fig_flow, ax_flow = plt.subplots(nrows=1, ncols=2)
+        cb1 = cb2 = None
+        fig_im, ax_im = plt.subplots(nrows=1, ncols=2)
+
+    from utils import frame_utils
+    import tqdm
+    smoothed_landmarks = []
+    landmarks_flow = None
+
+    # image size
+    from PIL import Image
+    im = Image.open(image_files[0])
+    width, height = im.size
+
+    os.makedirs(os.path.join(OUTPUT_DIR, 'smoothed'), exist_ok=True)
+    video_name = os.path.basename(os.path.dirname(image_files[0]))
+    for test_id in tqdm.tqdm(range(0, len(image_files) - 1), desc=video_name):
+        basename = os.path.basename(image_files[test_id + 1])
+        flow_file_name = os.path.join(OUTPUT_DIR, 'flow', f'{basename}.flow.npz')
+        if not os.path.exists(flow_file_name):
+            raise RuntimeError(f'Missing flow file: {flow_file_name}')
+        npz_file = np.load(flow_file_name)
+        flow = npz_file['flow']
+
+        if landmarks_flow is None:
+            landmarks_flow = landmarks[test_id, :, :]
+
+        # scale to flow size and back
+        scale_y = height / flow.shape[0]
+        scale_x = width / flow.shape[1]
+        landmarks_scaled = landmarks_flow / [scale_x, scale_y]
+        landmarks_flow_updated = motion_from_flow(flow, landmarks_scaled)
+        landmarks_flow_updated = landmarks_flow_updated * [scale_x, scale_y]
+
+        # ensure consistency with tracking
+        landmarks_flow = adjust_flow_with_tracking(landmarks_flow_updated, landmarks[test_id + 1, :, :])
+
+        smoothed_landmarks.append(landmarks_flow)
+
+        if display:
+            image1 = frame_utils.read_gen(image_files[test_id])
+            image2 = frame_utils.read_gen(image_files[test_id + 1])
+
+            image1 = np.array(image1).astype(np.uint8)
+            image2 = np.array(image2).astype(np.uint8)
+
+            if cb1 is not None:
+                cb1.remove()
+                cb2.remove()
+            ax_flow[0].cla()
+            im1 = ax_flow[0].imshow(flow[:, :, 0])
+            ax_flow[1].cla()
+            im2 = ax_flow[1].imshow(flow[:, :, 1])
+            cb1 = fig_flow.colorbar(im1, ax=ax_flow[0])
+            cb2 = fig_flow.colorbar(im2, ax=ax_flow[1])
+            fig_flow.show()
+            fig_flow.canvas.draw()
+
+            ax_im[0].cla()
+            ax_im[0].imshow(image1)
+            ax_im[0].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1])
+            ax_im[1].cla()
+            ax_im[1].imshow(image2)
+            ax_im[1].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1], marker='.')
+            ax_im[1].scatter(landmarks[test_id + 1, :, 0], landmarks[test_id + 1, :, 1], marker='+')
+            ax_im[1].scatter(landmarks_flow_updated[:, 0], landmarks_flow_updated[:, 1], marker='.')
+            ax_im[1].scatter(landmarks_flow[:, 0], landmarks_flow[:, 1], marker='+')
+            fig_im.show()
+            fig_im.canvas.draw()
+            plt.pause(0.001)
+            pass
+
+    smoothed_landmarks = np.array(smoothed_landmarks)
+    output_file_name = os.path.join(OUTPUT_DIR, 'smoothed', f'{video_name}.smoothed.npz')
+    np.savez(output_file_name,
+             landmarks=landmarks,
+             smoothed_landmarks=smoothed_landmarks,
+             image_files=image_files)
+    return smoothed_landmarks
+
+
+def optical_flow_smooth_all(display=False):
+    all_image_files, all_landmarks = get_test_data()
+
+    for image_files, landmarks in zip(all_image_files, all_landmarks):
+        flow_smooth_video(image_files, landmarks,
+                          display=display,
+                          )
+
+
 def main(args):
     optical_flow_compute_all(args,
-                             redo_flow=True,
+                             redo_flow=False,
                              display=False,
                              retain_inference_size=True)
+
+    # optical_flow_smooth_all(display=False, )
 
 
 if __name__ == '__main__':
