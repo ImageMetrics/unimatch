@@ -95,6 +95,7 @@ _COMPARISON_REGIONS = {
     ],
 }
 ROOT_DIR = r'z:\LocalWorkingRoot\SLPT'
+OUTPUT_DIR = r'z:\LocalWorkingRoot\unimatch'
 
 
 def get_args_parser():
@@ -136,16 +137,19 @@ def get_args_parser():
                         help='predict bidirectional flow')
 
     parser.add_argument('--local_rank', default=0, type=int)
+    parser.add_argument('--fixed_inference_size', default=None, type=int, nargs='+',
+                        help='can specify the inference size for the input to the network')
 
     return parser
 
 
 def get_test_data(track_only_regions=True):
-
     # test data file
     import glob
     test_files = glob.glob(os.path.join(ROOT_DIR, r'Results\LDSDK\*.npz'))
 
+    all_landmarks = []
+    all_image_files = []
     for test_data_file in test_files:
         npz_file = np.load(test_data_file)
         if track_only_regions:
@@ -165,15 +169,17 @@ def get_test_data(track_only_regions=True):
         else:
             image_files = npz_file['image_files']
             landmarks = npz_file['landmarks']
+        all_landmarks.append(landmarks)
+        all_image_files.append(image_files)
 
-    return image_files, landmarks
+    return all_image_files, all_landmarks
 
 
 def motion_from_flow(flow, landmarks):
     from scipy.interpolate import RegularGridInterpolator
 
     interp = RegularGridInterpolator((range(flow.shape[0]), range(flow.shape[1])), flow)
-    uv = interp(landmarks)
+    uv = interp(landmarks[:, [1, 0]])
     landmarks_out = landmarks.copy()
     # image is transposed
     landmarks_out[:, 0] += uv[:, 1]
@@ -181,132 +187,213 @@ def motion_from_flow(flow, landmarks):
     return landmarks_out
 
 
+def adjust_flow_with_tracking(flow_landmarks, landmarks):
+    # distance between eyes
+    norm_dist = np.linalg.norm(landmarks[28, :] - landmarks[26, :])
+
+    d = (flow_landmarks - landmarks) / norm_dist
+    sigma_x = 0.03
+    w_x = np.exp(-0.5 * np.square(d[:, 0] / sigma_x))
+    sigma_y = 0.001
+    w_y = np.exp(-0.5 * np.square(d[:, 1] / sigma_y))
+
+    out_landmarks = flow_landmarks.copy()
+    out_landmarks[:, 0] = out_landmarks[:, 0] * w_x + landmarks[:, 0] * (1 - w_x)
+    out_landmarks[:, 1] = out_landmarks[:, 1] * w_y + landmarks[:, 1] * (1 - w_y)
+    return out_landmarks
+
 @torch.no_grad()
-def inference_flow(model, filenames, landmarks,
-                   fixed_inference_size = None,
-                   padding_factor=32,
-                   attn_type='swin',
-                   attn_splits_list=None,
-                   corr_radius_list=None,
-                   prop_radius_list=None,
-                   num_reg_refine=1,
-                   pred_bidir_flow=False,
-                   ):
-    from utils import frame_utils
-
-    model.eval()
-
+def compute_flow(model, image1, image2,
+                 retain_inference_size=False,
+                 fixed_inference_size=None,
+                 padding_factor=32,
+                 attn_type='swin',
+                 attn_splits_list=None,
+                 corr_radius_list=None,
+                 prop_radius_list=None,
+                 num_reg_refine=1,
+                 pred_bidir_flow=False,
+                 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    import matplotlib.pyplot as plt
-    plt.figure(1)
-    fig_flow, ax_flow = plt.subplots(nrows=1, ncols=2)
-    cb1 = cb2 = None
-    plt.figure(2)
-    fig_im, ax_im = plt.subplots(nrows=1, ncols=2)
+    image1 = np.array(image1).astype(np.uint8)
+    image2 = np.array(image2).astype(np.uint8)
 
-    for test_id in range(37, len(filenames) - 1):
-        image1 = frame_utils.read_gen(filenames[test_id])
-        image2 = frame_utils.read_gen(filenames[test_id + 1])
+    if len(image1.shape) == 2:  # gray image
+        image1 = np.tile(image1[..., None], (1, 1, 3))
+        image2 = np.tile(image2[..., None], (1, 1, 3))
+    else:
+        image1 = image1[..., :3]
+        image2 = image2[..., :3]
 
-        image1 = np.array(image1).astype(np.uint8)
-        image2 = np.array(image2).astype(np.uint8)
+    image1 = torch.from_numpy(image1).permute(2, 0, 1).float().unsqueeze(0).to(device)
+    image2 = torch.from_numpy(image2).permute(2, 0, 1).float().unsqueeze(0).to(device)
 
-        disp_im_1 = image1
-        disp_im_2 = image2
+    # the model is trained with size: width > height
+    transpose_img = False
+    if image1.size(-2) > image1.size(-1):
+        image1 = torch.transpose(image1, -2, -1)
+        image2 = torch.transpose(image2, -2, -1)
+        transpose_img = True
 
-        if len(image1.shape) == 2:  # gray image
-            image1 = np.tile(image1[..., None], (1, 1, 3))
-            image2 = np.tile(image2[..., None], (1, 1, 3))
-        else:
-            image1 = image1[..., :3]
-            image2 = image2[..., :3]
+    nearest_size = [int(np.ceil(image1.size(-2) / padding_factor)) * padding_factor,
+                    int(np.ceil(image1.size(-1) / padding_factor)) * padding_factor]
 
-        image1 = torch.from_numpy(image1).permute(2, 0, 1).float().unsqueeze(0).to(device)
-        image2 = torch.from_numpy(image2).permute(2, 0, 1).float().unsqueeze(0).to(device)
+    # resize to nearest size or specified size
+    inference_size = nearest_size if fixed_inference_size is None else fixed_inference_size
 
-        # the model is trained with size: width > height
-        transpose_img = False
-        if image1.size(-2) > image1.size(-1):
-            image1 = torch.transpose(image1, -2, -1)
-            image2 = torch.transpose(image2, -2, -1)
-            transpose_img = True
+    ori_size = image1.shape[-2:]
 
-        nearest_size = [int(np.ceil(image1.size(-2) / padding_factor)) * padding_factor,
-                        int(np.ceil(image1.size(-1) / padding_factor)) * padding_factor]
+    # resize before inference
+    if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
+        image1 = F.interpolate(image1, size=inference_size, mode='bilinear',
+                               align_corners=True)
+        image2 = F.interpolate(image2, size=inference_size, mode='bilinear',
+                               align_corners=True)
 
-        # resize to nearest size or specified size
-        inference_size = nearest_size if fixed_inference_size is None else fixed_inference_size
+    results_dict = model(image1, image2,
+                         attn_type=attn_type,
+                         attn_splits_list=attn_splits_list,
+                         corr_radius_list=corr_radius_list,
+                         prop_radius_list=prop_radius_list,
+                         num_reg_refine=num_reg_refine,
+                         task='flow',
+                         pred_bidir_flow=pred_bidir_flow,
+                         )
 
-        ori_size = image1.shape[-2:]
+    flow_pr = results_dict['flow_preds'][-1]  # [B, 2, H, W]
 
-        # resize before inference
-        if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
-            image1 = F.interpolate(image1, size=inference_size, mode='bilinear',
-                                   align_corners=True)
-            image2 = F.interpolate(image2, size=inference_size, mode='bilinear',
-                                   align_corners=True)
-
-        results_dict = model(image1, image2,
-                             attn_type=attn_type,
-                             attn_splits_list=attn_splits_list,
-                             corr_radius_list=corr_radius_list,
-                             prop_radius_list=prop_radius_list,
-                             num_reg_refine=num_reg_refine,
-                             task='flow',
-                             pred_bidir_flow=pred_bidir_flow,
-                             )
-
-        flow_pr = results_dict['flow_preds'][-1]  # [B, 2, H, W]
-
-        # resize back
+    # resize back if required
+    if not retain_inference_size:
         if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
             flow_pr = F.interpolate(flow_pr, size=ori_size, mode='bilinear',
                                     align_corners=True)
             flow_pr[:, 0] = flow_pr[:, 0] * ori_size[-1] / inference_size[-1]
             flow_pr[:, 1] = flow_pr[:, 1] * ori_size[-2] / inference_size[-2]
 
-        if transpose_img:
-            flow_pr = torch.transpose(flow_pr, -2, -1)
+    if transpose_img:
+        flow_pr = torch.transpose(flow_pr, -2, -1)
 
-        flow = flow_pr[0].permute(1, 2, 0).cpu().numpy()  # [H, W, 2]
+    flow = flow_pr[0].permute(1, 2, 0).cpu().numpy()  # [H, W, 2]
 
-        if cb1 is not None:
-            cb1.remove()
-            cb2.remove()
-        ax_flow[0].cla()
-        im1 = ax_flow[0].imshow(flow[:, :, 0])
-        ax_flow[1].cla()
-        im2 = ax_flow[1].imshow(flow[:, :, 1])
-        cb1 = fig_flow.colorbar(im1, ax=ax_flow[0])
-        cb2 = fig_flow.colorbar(im2, ax=ax_flow[1])
-        # fig_flow.colorbar(im, ax=ax_flow[1])
-        fig_flow.show()
+    return flow
 
-        ax_im[0].cla()
-        ax_im[0].imshow(disp_im_1)
-        ax_im[0].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1])
-        ax_im[1].cla()
-        ax_im[1].imshow(disp_im_2)
-        ax_im[1].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1], marker='.')
-        ax_im[1].scatter(landmarks[test_id+1, :, 0], landmarks[test_id+1, :, 1], marker='.')
 
-        pass
-        # BROW_INNER_LEFT: 0
-        # BROW_INNER_RIGHT: 2
-        # BROW_OUTER_LEFT: 14
-        # BROW_OUTER_RIGHT: 15
-        # NOSE_RIDGE_TIP: 72
-        landmark_inds = [0, 2, 14, 15, 72]
-        landmarks_flow = motion_from_flow(flow, landmarks[test_id, landmark_inds, :])
-        ax_im[1].scatter(landmarks_flow[:, 0], landmarks_flow[:, 1], marker='.')
+# @torch.no_grad()
+# def inference_flow(model, filenames, landmarks,
+#                    redo_flow=False,
+#                    fixed_inference_size = None,
+#                    padding_factor=32,
+#                    attn_type='swin',
+#                    attn_splits_list=None,
+#                    corr_radius_list=None,
+#                    prop_radius_list=None,
+#                    num_reg_refine=1,
+#                    pred_bidir_flow=False,
+#                    ):
+#     import matplotlib.pyplot as plt
+#     plt.figure(1)
+#     fig_flow, ax_flow = plt.subplots(nrows=1, ncols=2)
+#     cb1 = cb2 = None
+#     plt.figure(2)
+#     fig_im, ax_im = plt.subplots(nrows=1, ncols=2)
+#
+#     landmarks_flow = None
+#
+#
+#         if cb1 is not None:
+#             cb1.remove()
+#             cb2.remove()
+#         ax_flow[0].cla()
+#         im1 = ax_flow[0].imshow(flow[:, :, 0])
+#         ax_flow[1].cla()
+#         im2 = ax_flow[1].imshow(flow[:, :, 1])
+#         cb1 = fig_flow.colorbar(im1, ax=ax_flow[0])
+#         cb2 = fig_flow.colorbar(im2, ax=ax_flow[1])
+#         # fig_flow.colorbar(im, ax=ax_flow[1])
+#         fig_flow.show()
+#
+#         ax_im[0].cla()
+#         ax_im[0].imshow(disp_im_1)
+#         ax_im[0].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1])
+#         ax_im[1].cla()
+#         ax_im[1].imshow(disp_im_2)
+#         ax_im[1].scatter(landmarks[test_id, :, 0], landmarks[test_id, :, 1], marker='.')
+#         ax_im[1].scatter(landmarks[test_id+1, :, 0], landmarks[test_id+1, :, 1], marker='+')
+#
+#         pass
+#         # BROW_INNER_LEFT: 0
+#         # BROW_INNER_RIGHT: 2
+#         # BROW_OUTER_LEFT: 14
+#         # BROW_OUTER_RIGHT: 15
+#         # NOSE_RIDGE_TIP: 72
+#         landmark_inds = [0, 2, 14, 15, 72]
+#
+#         if landmarks_flow is None:
+#             landmarks_flow = landmarks[test_id, :, :]
+#
+#         landmarks_flow = motion_from_flow(flow, landmarks_flow)
+#         ax_im[1].scatter(landmarks_flow[:, 0], landmarks_flow[:, 1], marker='.')
+#
+#         landmarks_flow = adjust_flow_with_tracking(landmarks_flow, landmarks[test_id+1, :, :])
+#         ax_im[1].scatter(landmarks_flow[:, 0], landmarks_flow[:, 1], marker='+')
+#
+#         fig_im.canvas.draw()
+#         fig_im.show()
+#         pass
 
-        fig_im.canvas.draw()
-        fig_im.show()
-        pass
+def compute_flow_video(model, image_files,
+                       retain_inference_size=False,
+                       redo_flow=False,
+                       display=False,
+                       **kwargs
+                       ):
+    if display:
+        import matplotlib.pyplot as plt
+        fig_flow, ax_flow = plt.subplots(nrows=1, ncols=2)
+        cb1 = cb2 = None
 
-def optical_flow_smooth(args):
-    image_files, landmarks = get_test_data()
+    from utils import frame_utils
+    os.makedirs(os.path.join(OUTPUT_DIR, 'flow'), exist_ok=True)
+    for test_id in range(0, len(image_files) - 1):
+        basename = os.path.basename(image_files[test_id + 1])
+        output_file_name = os.path.join(OUTPUT_DIR, 'flow', f'{basename}.flow.npz')
+        if redo_flow or not os.path.exists(output_file_name):
+            image1 = frame_utils.read_gen(image_files[test_id])
+            image2 = frame_utils.read_gen(image_files[test_id + 1])
+
+            flow = compute_flow(model, image1, image2,
+                                retain_inference_size=retain_inference_size,
+                                **kwargs
+                                )
+            np.savez(output_file_name, flow=flow)
+
+            if display:
+                if cb1 is not None:
+                    cb1.remove()
+                    cb2.remove()
+                ax_flow[0].cla()
+                im1 = ax_flow[0].imshow(flow[:, :, 0])
+                ax_flow[1].cla()
+                im2 = ax_flow[1].imshow(flow[:, :, 1])
+                cb1 = fig_flow.colorbar(im1, ax=ax_flow[0])
+                cb2 = fig_flow.colorbar(im2, ax=ax_flow[1])
+                fig_flow.show()
+                fig_flow.canvas.draw()
+                plt.pause(0.001)
+        else:
+            npz_file = np.load(output_file_name)
+            flow = npz_file['flow']
+
+    return flow
+
+
+def optical_flow_compute_all(args,
+                             redo_flow=False,
+                             display=False,
+                             retain_inference_size=False,
+                             ):
+    all_image_files, all_landmarks = get_test_data()
 
     seed = args.seed
     torch.manual_seed(seed)
@@ -328,27 +415,34 @@ def optical_flow_smooth(args):
                      reg_refine=args.reg_refine,
                      task=args.task).to(device)
 
-    model_without_ddp = model
-
     print('Load checkpoint: %s' % args.resume)
     loc = 'cuda:{}'.format(args.local_rank) if torch.cuda.is_available() else 'cpu'
     checkpoint = torch.load(args.resume, map_location=loc)
 
-    model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+    model.load_state_dict(checkpoint['model'], strict=False)
 
-    inference_flow(model_without_ddp, image_files, landmarks,
-                   padding_factor=args.padding_factor,
-                   attn_type=args.attn_type,
-                   attn_splits_list=args.attn_splits_list,
-                   corr_radius_list=args.corr_radius_list,
-                   prop_radius_list=args.prop_radius_list,
-                   pred_bidir_flow=args.pred_bidir_flow,
-                   num_reg_refine=args.num_reg_refine,
-                   )
+    model.eval()
 
+    for image_files in all_image_files:
+        compute_flow_video(model, image_files,
+                           redo_flow=redo_flow,
+                           display=display,
+                           retain_inference_size=retain_inference_size,
+                           padding_factor=args.padding_factor,
+                           attn_type=args.attn_type,
+                           attn_splits_list=args.attn_splits_list,
+                           corr_radius_list=args.corr_radius_list,
+                           prop_radius_list=args.prop_radius_list,
+                           pred_bidir_flow=args.pred_bidir_flow,
+                           num_reg_refine=args.num_reg_refine,
+                           fixed_inference_size=args.fixed_inference_size,
+                           )
 
 def main(args):
-    optical_flow_smooth(args)
+    optical_flow_compute_all(args,
+                             redo_flow=True,
+                             display=False,
+                             retain_inference_size=True)
 
 
 if __name__ == '__main__':
