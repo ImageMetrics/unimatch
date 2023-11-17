@@ -191,10 +191,16 @@ def adjust_flow_with_tracking(flow_landmarks, landmarks):
     # distance between eyes
     norm_dist = np.linalg.norm(landmarks[28, :] - landmarks[26, :])
 
+    # sigmas
+    sigma_x = np.zeros(85) + 1e-5
+    sigma_x[0:16] = 0.05  # BROWS
+    sigma_x[67:75] = 0.05  # NOSE
+    sigma_y = np.zeros(85) + 1e-5
+    sigma_y[0:16] = 0.025  # BROWS
+    sigma_y[67:75] = 0.05  # NOSE
+
     d = (flow_landmarks - landmarks) / norm_dist
-    sigma_x = 0.03
     w_x = np.exp(-0.5 * np.square(d[:, 0] / sigma_x))
-    sigma_y = 0.001
     w_y = np.exp(-0.5 * np.square(d[:, 1] / sigma_y))
 
     out_landmarks = flow_landmarks.copy()
@@ -384,8 +390,6 @@ def flow_smooth_video(image_files, landmarks,
 
     from utils import frame_utils
     import tqdm
-    smoothed_landmarks = []
-    landmarks_flow = None
 
     # image size
     from PIL import Image
@@ -394,6 +398,8 @@ def flow_smooth_video(image_files, landmarks,
 
     os.makedirs(os.path.join(OUTPUT_DIR, 'smoothed'), exist_ok=True)
     video_name = os.path.basename(os.path.dirname(image_files[0]))
+    landmarks_flow = landmarks[0, :, :]
+    smoothed_landmarks = [landmarks_flow, ]
     for test_id in tqdm.tqdm(range(0, len(image_files) - 1), desc=video_name):
         basename = os.path.basename(image_files[test_id + 1])
         flow_file_name = os.path.join(OUTPUT_DIR, 'flow', f'{basename}.flow.npz')
@@ -401,9 +407,6 @@ def flow_smooth_video(image_files, landmarks,
             raise RuntimeError(f'Missing flow file: {flow_file_name}')
         npz_file = np.load(flow_file_name)
         flow = npz_file['flow']
-
-        if landmarks_flow is None:
-            landmarks_flow = landmarks[test_id, :, :]
 
         # scale to flow size and back
         scale_y = height / flow.shape[0]
@@ -469,12 +472,12 @@ def optical_flow_smooth_all(display=False):
 
 
 def main(args):
-    optical_flow_compute_all(args,
-                             redo_flow=False,
-                             display=False,
-                             retain_inference_size=True)
+    # optical_flow_compute_all(args,
+    #                          redo_flow=False,
+    #                          display=False,
+    #                          retain_inference_size=True)
 
-    # optical_flow_smooth_all(display=False, )
+    optical_flow_smooth_all(display=False, )
 
 
 if __name__ == '__main__':
